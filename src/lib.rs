@@ -6,12 +6,6 @@
 //! experience on all platforms with a cross-platform API that deals with all
 //! the underlying details for you.
 //!
-//! ```toml
-//! # Cargo.toml
-//! [dependencies]
-//! native-tls = "0.1"
-//! ```
-//!
 //! # How is this implemented?
 //!
 //! This crate uses SChannel on Windows (via the `schannel` crate), Secure
@@ -19,12 +13,6 @@
 //! `openssl` crate) on all other platforms. Future futures may also enable
 //! other TLS frameworks as well, but these initial libraries are likely to
 //! remain as the defaults.
-//!
-//! If you know you're on a particular platform then you can use the
-//! platform-specific extension traits in this crate to configure the underlying
-//! details of that platform. For example OpenSSL may have more options for
-//! configuration than Secure Transport. By default, though, the API of this
-//! crate works across all platforms.
 //!
 //! Note that this crate also strives to be secure-by-default. For example when
 //! using OpenSSL it will configure validation callbacks to ensure that
@@ -38,13 +26,16 @@
 //!
 //! * TLS/SSL client communication
 //! * TLS/SSL server communication
-//! * PKCS#12 encoded server identities
+//! * PKCS#12 encoded identities
 //! * Secure-by-default for client and server
 //!     * Includes hostname verification for clients
 //! * Supports asynchronous I/O for both the server and the client
 //!
-//! Each implementation may support more features which can be accessed through
-//! the extension traits in the `backend` module.
+//! # Cargo Features
+//!
+//! * `vendored` - If enabled, the crate will compile and statically link to a
+//!     vendored copy of OpenSSL. This feature has no effect on Windows and
+//!     macOS, where OpenSSL is not used.
 //!
 //! # Examples
 //!
@@ -55,7 +46,7 @@
 //! use std::io::{Read, Write};
 //! use std::net::TcpStream;
 //!
-//! let connector = TlsConnector::builder().unwrap().build().unwrap();
+//! let connector = TlsConnector::new().unwrap();
 //!
 //! let stream = TcpStream::connect("google.com:443").unwrap();
 //! let mut stream = connector.connect("google.com", stream).unwrap();
@@ -69,7 +60,7 @@
 //! To accept connections as a server from remote clients:
 //!
 //! ```rust,no_run
-//! use native_tls::{Pkcs12, TlsAcceptor, TlsStream};
+//! use native_tls::{Identity, TlsAcceptor, TlsStream};
 //! use std::fs::File;
 //! use std::io::{Read};
 //! use std::net::{TcpListener, TcpStream};
@@ -77,12 +68,12 @@
 //! use std::thread;
 //!
 //! let mut file = File::open("identity.pfx").unwrap();
-//! let mut pkcs12 = vec![];
-//! file.read_to_end(&mut pkcs12).unwrap();
-//! let pkcs12 = Pkcs12::from_der(&pkcs12, "hunter2").unwrap();
+//! let mut identity = vec![];
+//! file.read_to_end(&mut identity).unwrap();
+//! let identity = Identity::from_pkcs12(&identity, "hunter2").unwrap();
 //!
 //! let listener = TcpListener::bind("0.0.0.0:8443").unwrap();
-//! let acceptor = TlsAcceptor::builder(pkcs12).unwrap().build().unwrap();
+//! let acceptor = TlsAcceptor::new(identity).unwrap();
 //! let acceptor = Arc::new(acceptor);
 //!
 //! fn handle_client(stream: TlsStream<TcpStream>) {
@@ -102,32 +93,39 @@
 //!     }
 //! }
 //! ```
-#![doc(html_root_url="https://docs.rs/native-tls/0.1.2")]
+#![doc(html_root_url = "https://docs.rs/native-tls/0.2")]
 #![warn(missing_docs)]
+
+#[macro_use]
+#[cfg(any(target_os = "macos", target_os = "ios"))]
+extern crate lazy_static;
+
+#[cfg(test)]
+extern crate hex;
 
 use std::any::Any;
 use std::error;
-use std::error::Error as StdError;
-use std::io;
 use std::fmt;
+use std::io;
 use std::result;
 
-pub mod backend;
-
-#[cfg(target_os = "macos")]
+#[cfg(target_os = "android")]
+#[macro_use]
+extern crate log;
+#[cfg(any(target_os = "macos", target_os = "ios"))]
 #[path = "imp/security_framework.rs"]
 mod imp;
 #[cfg(target_os = "windows")]
 #[path = "imp/schannel.rs"]
 mod imp;
-#[cfg(not(any(target_os = "macos", target_os = "windows")))]
+#[cfg(not(any(target_os = "macos", target_os = "windows", target_os = "ios")))]
 #[path = "imp/openssl.rs"]
 mod imp;
 
 #[cfg(test)]
 mod test;
 
-/// A typedef of the result type returned by many methods.
+/// A typedef of the result-type returned by many methods.
 pub type Result<T> = result::Result<T, Error>;
 
 /// An error returned from the TLS implementation.
@@ -161,10 +159,13 @@ impl From<imp::Error> for Error {
     }
 }
 
-/// A PKCS #12 archive.
-pub struct Pkcs12(imp::Pkcs12);
+/// A cryptographic identity.
+///
+/// An identity is an X509 certificate along with its corresponding private key and chain of certificates to a trusted
+/// root.
+pub struct Identity(imp::Identity);
 
-impl Pkcs12 {
+impl Identity {
     /// Parses a DER-formatted PKCS #12 archive, using the specified password to decrypt the key.
     ///
     /// The archive should contain a leaf certificate and its private key, as well any intermediate
@@ -177,20 +178,33 @@ impl Pkcs12 {
     /// ```bash
     /// openssl pkcs12 -export -out identity.pfx -inkey key.pem -in cert.pem -certfile chain_certs.pem
     /// ```
-    pub fn from_der(der: &[u8], password: &str) -> Result<Pkcs12> {
-        let pkcs12 = try!(imp::Pkcs12::from_der(der, password));
-        Ok(Pkcs12(pkcs12))
+    pub fn from_pkcs12(der: &[u8], password: &str) -> Result<Identity> {
+        let identity = imp::Identity::from_pkcs12(der, password)?;
+        Ok(Identity(identity))
     }
 }
 
 /// An X509 certificate.
+#[derive(Clone)]
 pub struct Certificate(imp::Certificate);
 
 impl Certificate {
     /// Parses a DER-formatted X509 certificate.
     pub fn from_der(der: &[u8]) -> Result<Certificate> {
-        let cert = try!(imp::Certificate::from_der(der));
+        let cert = imp::Certificate::from_der(der)?;
         Ok(Certificate(cert))
+    }
+
+    /// Parses a PEM-formatted X509 certificate.
+    pub fn from_pem(der: &[u8]) -> Result<Certificate> {
+        let cert = imp::Certificate::from_pem(der)?;
+        Ok(Certificate(cert))
+    }
+
+    /// Returns the DER-encoded representation of this certificate.
+    pub fn to_der(&self) -> Result<Vec<u8>> {
+        let der = self.0.to_der()?;
+        Ok(der)
     }
 }
 
@@ -198,7 +212,8 @@ impl Certificate {
 pub struct MidHandshakeTlsStream<S>(imp::MidHandshakeTlsStream<S>);
 
 impl<S> fmt::Debug for MidHandshakeTlsStream<S>
-    where S: fmt::Debug
+where
+    S: fmt::Debug,
 {
     fn fmt(&self, fmt: &mut fmt::Formatter) -> fmt::Result {
         fmt::Debug::fmt(&self.0, fmt)
@@ -206,7 +221,8 @@ impl<S> fmt::Debug for MidHandshakeTlsStream<S>
 }
 
 impl<S> MidHandshakeTlsStream<S>
-    where S: io::Read + io::Write
+where
+    S: io::Read + io::Write,
 {
     /// Returns a shared reference to the inner stream.
     pub fn get_ref(&self) -> &S {
@@ -223,7 +239,7 @@ impl<S> MidHandshakeTlsStream<S>
     /// If the handshake completes successfully then the negotiated stream is
     /// returned. If there is a problem, however, then an error is returned.
     /// Note that the error may not be fatal. For example if the underlying
-    /// stream is an asynchronous one then `HandshakeError::Interrupted` may
+    /// stream is an asynchronous one then `HandshakeError::WouldBlock` may
     /// just mean to wait for more I/O to happen later.
     pub fn handshake(self) -> result::Result<TlsStream<S>, HandshakeError<S>> {
         match self.0.handshake() {
@@ -245,36 +261,34 @@ pub enum HandshakeError<S> {
     /// Note that this is not a fatal error and it should be safe to call
     /// `handshake` at a later time once the stream is ready to perform I/O
     /// again.
-    Interrupted(MidHandshakeTlsStream<S>),
+    WouldBlock(MidHandshakeTlsStream<S>),
 }
 
 impl<S> error::Error for HandshakeError<S>
-    where S: Any + fmt::Debug
+where
+    S: Any + fmt::Debug,
 {
     fn description(&self) -> &str {
-        match *self {
-            HandshakeError::Failure(ref e) => e.description(),
-            HandshakeError::Interrupted(_) => "the handshake process was interrupted",
-        }
+        "handshake error"
     }
 
     fn cause(&self) -> Option<&error::Error> {
         match *self {
             HandshakeError::Failure(ref e) => Some(e),
-            HandshakeError::Interrupted(_) => None,
+            HandshakeError::WouldBlock(_) => None,
         }
     }
 }
 
 impl<S> fmt::Display for HandshakeError<S>
-    where S: Any + fmt::Debug
+where
+    S: Any + fmt::Debug,
 {
     fn fmt(&self, fmt: &mut fmt::Formatter) -> fmt::Result {
-        try!(fmt.write_str(self.description()));
-        if let Some(cause) = self.cause() {
-            try!(write!(fmt, ": {}", cause));
+        match *self {
+            HandshakeError::Failure(ref e) => fmt::Display::fmt(e, fmt),
+            HandshakeError::WouldBlock(_) => fmt.write_str("the handshake process was interrupted"),
         }
-        Ok(())
     }
 }
 
@@ -282,8 +296,8 @@ impl<S> From<imp::HandshakeError<S>> for HandshakeError<S> {
     fn from(e: imp::HandshakeError<S>) -> HandshakeError<S> {
         match e {
             imp::HandshakeError::Failure(e) => HandshakeError::Failure(Error(e)),
-            imp::HandshakeError::Interrupted(s) => {
-                HandshakeError::Interrupted(MidHandshakeTlsStream(s))
+            imp::HandshakeError::WouldBlock(s) => {
+                HandshakeError::WouldBlock(MidHandshakeTlsStream(s))
             }
         }
     }
@@ -310,38 +324,99 @@ pub enum Protocol {
 }
 
 /// A builder for `TlsConnector`s.
-pub struct TlsConnectorBuilder(imp::TlsConnectorBuilder);
+pub struct TlsConnectorBuilder {
+    identity: Option<Identity>,
+    min_protocol: Option<Protocol>,
+    max_protocol: Option<Protocol>,
+    root_certificates: Vec<Certificate>,
+    accept_invalid_certs: bool,
+    accept_invalid_hostnames: bool,
+    use_sni: bool,
+}
 
 impl TlsConnectorBuilder {
     /// Sets the identity to be used for client certificate authentication.
-    pub fn identity(&mut self, pkcs12: Pkcs12) -> Result<&mut TlsConnectorBuilder> {
-        try!(self.0.identity(pkcs12.0));
-        Ok(self)
+    pub fn identity(&mut self, identity: Identity) -> &mut TlsConnectorBuilder {
+        self.identity = Some(identity);
+        self
     }
 
-    /// Sets the protocols which the connector will support.
+    /// Sets the minimum supported protocol version.
     ///
-    /// The protocols supported by default are currently TLS 1.0, TLS 1.1, and TLS 1.2, though this
-    /// is subject to change.
-    pub fn supported_protocols(&mut self,
-                               protocols: &[Protocol])
-                               -> Result<&mut TlsConnectorBuilder> {
-        try!(self.0.supported_protocols(protocols));
-        Ok(self)
+    /// A value of `None` enables support for the oldest protocols supported by the implementation.
+    ///
+    /// Defaults to `Some(Protocol::Tlsv10)`.
+    pub fn min_protocol_version(&mut self, protocol: Option<Protocol>) -> &mut TlsConnectorBuilder {
+        self.min_protocol = protocol;
+        self
+    }
+
+    /// Sets the maximum supported protocol version.
+    ///
+    /// A value of `None` enables support for the newest protocols supported by the implementation.
+    ///
+    /// Defaults to `None`.
+    pub fn max_protocol_version(&mut self, protocol: Option<Protocol>) -> &mut TlsConnectorBuilder {
+        self.max_protocol = protocol;
+        self
     }
 
     /// Adds a certificate to the set of roots that the connector will trust.
     ///
     /// The connector will use the system's trust root by default. This method can be used to add
     /// to that set when communicating with servers not trusted by the system.
-    pub fn add_root_certificate(&mut self, cert: Certificate) -> Result<&mut TlsConnectorBuilder> {
-        try!(self.0.add_root_certificate(cert.0));
-        Ok(self)
+    ///
+    /// Defaults to an empty set.
+    pub fn add_root_certificate(&mut self, cert: Certificate) -> &mut TlsConnectorBuilder {
+        self.root_certificates.push(cert);
+        self
     }
 
-    /// Consumes the builder, returning a `TlsConnector`.
-    pub fn build(self) -> Result<TlsConnector> {
-        let connector = try!(self.0.build());
+    /// Controls the use of certificate validation.
+    ///
+    /// Defaults to `false`.
+    ///
+    /// # Warning
+    ///
+    /// You should think very carefully before using this method. If invalid certificates are trusted, *any*
+    /// certificate for *any* site will be trusted for use. This includes expired certificates. This introduces
+    /// significant vulnerabilities, and should only be used as a last resort.
+    pub fn danger_accept_invalid_certs(
+        &mut self,
+        accept_invalid_certs: bool,
+    ) -> &mut TlsConnectorBuilder {
+        self.accept_invalid_certs = accept_invalid_certs;
+        self
+    }
+
+    /// Controls the use of Server Name Indication (SNI).
+    ///
+    /// Defaults to `true`.
+    pub fn use_sni(&mut self, use_sni: bool) -> &mut TlsConnectorBuilder {
+        self.use_sni = use_sni;
+        self
+    }
+
+    /// Controls the use of hostname verification.
+    ///
+    /// Defaults to `false`.
+    ///
+    /// # Warning
+    ///
+    /// You should think very carefully before using this method. If invalid hostnames are trusted, *any* valid
+    /// certificate for *any* site will be trusted for use. This introduces significant vulnerabilities, and should
+    /// only be used as a last resort.
+    pub fn danger_accept_invalid_hostnames(
+        &mut self,
+        accept_invalid_hostnames: bool,
+    ) -> &mut TlsConnectorBuilder {
+        self.accept_invalid_hostnames = accept_invalid_hostnames;
+        self
+    }
+
+    /// Creates a new `TlsConnector`.
+    pub fn build(&self) -> Result<TlsConnector> {
+        let connector = imp::TlsConnector::new(self)?;
         Ok(TlsConnector(connector))
     }
 }
@@ -355,7 +430,7 @@ impl TlsConnectorBuilder {
 /// use std::io::{Read, Write};
 /// use std::net::TcpStream;
 ///
-/// let connector = TlsConnector::builder().unwrap().build().unwrap();
+/// let connector = TlsConnector::new().unwrap();
 ///
 /// let stream = TcpStream::connect("google.com:443").unwrap();
 /// let mut stream = connector.connect("google.com", stream).unwrap();
@@ -365,13 +440,26 @@ impl TlsConnectorBuilder {
 /// stream.read_to_end(&mut res).unwrap();
 /// println!("{}", String::from_utf8_lossy(&res));
 /// ```
+#[derive(Clone)]
 pub struct TlsConnector(imp::TlsConnector);
 
 impl TlsConnector {
+    /// Returns a new connector with default settings.
+    pub fn new() -> Result<TlsConnector> {
+        TlsConnector::builder().build()
+    }
+
     /// Returns a new builder for a `TlsConnector`.
-    pub fn builder() -> Result<TlsConnectorBuilder> {
-        let builder = try!(imp::TlsConnector::builder());
-        Ok(TlsConnectorBuilder(builder))
+    pub fn builder() -> TlsConnectorBuilder {
+        TlsConnectorBuilder {
+            identity: None,
+            min_protocol: Some(Protocol::Tlsv10),
+            max_protocol: None,
+            root_certificates: vec![],
+            use_sni: true,
+            accept_invalid_certs: false,
+            accept_invalid_hostnames: false,
+        }
     }
 
     /// Initiates a TLS handshake.
@@ -380,53 +468,56 @@ impl TlsConnector {
     /// validation.
     ///
     /// If the socket is nonblocking and a `WouldBlock` error is returned during
-    /// the handshake, a `HandshakeError::Interrupted` error will be returned
+    /// the handshake, a `HandshakeError::WouldBlock` error will be returned
     /// which can be used to restart the handshake when the socket is ready
     /// again.
-    pub fn connect<S>(&self,
-                      domain: &str,
-                      stream: S)
-                      -> result::Result<TlsStream<S>, HandshakeError<S>>
-        where S: io::Read + io::Write
-    {
-        let s = try!(self.0.connect(domain, stream));
-        Ok(TlsStream(s))
-    }
-
-    /// Like `connect`, but does not validate the server's domain name against its certificate.
     ///
-    /// # Warning
-    ///
-    /// You should think very carefully before you use this method. If hostname verification is not
-    /// used, *any* valid certificate for *any* site will be trusted for use from any other. This
-    /// introduces a significant vulnerability to man-in-the-middle attacks.
-    pub fn danger_connect_without_providing_domain_for_certificate_verification_and_server_name_indication<S>(
-            &self, stream: S) -> result::Result<TlsStream<S>, HandshakeError<S>>
-        where S: io::Read + io::Write
+    /// The domain is ignored if both SNI and hostname verification are
+    /// disabled.
+    pub fn connect<S>(
+        &self,
+        domain: &str,
+        stream: S,
+    ) -> result::Result<TlsStream<S>, HandshakeError<S>>
+    where
+        S: io::Read + io::Write,
     {
-        let s = try!(self.0.connect_no_domain(stream));
+        let s = self.0.connect(domain, stream)?;
         Ok(TlsStream(s))
     }
 }
 
 /// A builder for `TlsAcceptor`s.
-pub struct TlsAcceptorBuilder(imp::TlsAcceptorBuilder);
+pub struct TlsAcceptorBuilder {
+    identity: Identity,
+    min_protocol: Option<Protocol>,
+    max_protocol: Option<Protocol>,
+}
 
 impl TlsAcceptorBuilder {
-    /// Sets the protocols which the acceptor will support.
+    /// Sets the minimum supported protocol version.
     ///
-    /// The protocols supported by default are currently TLS 1.0, TLS 1.1, and TLS 1.2, though this
-    /// is subject to change.
-    pub fn supported_protocols(&mut self,
-                               protocols: &[Protocol])
-                               -> Result<&mut TlsAcceptorBuilder> {
-        try!(self.0.supported_protocols(protocols));
-        Ok(self)
+    /// A value of `None` enables support for the oldest protocols supported by the implementation.
+    ///
+    /// Defaults to `Some(Protocol::Tlsv10)`.
+    pub fn min_protocol_version(&mut self, protocol: Option<Protocol>) -> &mut TlsAcceptorBuilder {
+        self.min_protocol = protocol;
+        self
     }
 
-    /// Consumes the builder, returning a `TlsAcceptor`.
-    pub fn build(self) -> Result<TlsAcceptor> {
-        let acceptor = try!(self.0.build());
+    /// Sets the maximum supported protocol version.
+    ///
+    /// A value of `None` enables support for the newest protocols supported by the implementation.
+    ///
+    /// Defaults to `None`.
+    pub fn max_protocol_version(&mut self, protocol: Option<Protocol>) -> &mut TlsAcceptorBuilder {
+        self.max_protocol = protocol;
+        self
+    }
+
+    /// Creates a new `TlsAcceptor`.
+    pub fn build(&self) -> Result<TlsAcceptor> {
+        let acceptor = imp::TlsAcceptor::new(self)?;
         Ok(TlsAcceptor(acceptor))
     }
 }
@@ -436,7 +527,7 @@ impl TlsAcceptorBuilder {
 /// # Examples
 ///
 /// ```rust,no_run
-/// use native_tls::{Pkcs12, TlsAcceptor, TlsStream};
+/// use native_tls::{Identity, TlsAcceptor, TlsStream};
 /// use std::fs::File;
 /// use std::io::{Read};
 /// use std::net::{TcpListener, TcpStream};
@@ -444,12 +535,12 @@ impl TlsAcceptorBuilder {
 /// use std::thread;
 ///
 /// let mut file = File::open("identity.pfx").unwrap();
-/// let mut pkcs12 = vec![];
-/// file.read_to_end(&mut pkcs12).unwrap();
-/// let pkcs12 = Pkcs12::from_der(&pkcs12, "hunter2").unwrap();
+/// let mut identity = vec![];
+/// file.read_to_end(&mut identity).unwrap();
+/// let identity = Identity::from_pkcs12(&identity, "hunter2").unwrap();
 ///
 /// let listener = TcpListener::bind("0.0.0.0:8443").unwrap();
-/// let acceptor = TlsAcceptor::builder(pkcs12).unwrap().build().unwrap();
+/// let acceptor = TlsAcceptor::new(identity).unwrap();
 /// let acceptor = Arc::new(acceptor);
 ///
 /// fn handle_client(stream: TlsStream<TcpStream>) {
@@ -469,27 +560,37 @@ impl TlsAcceptorBuilder {
 ///     }
 /// }
 /// ```
+#[derive(Clone)]
 pub struct TlsAcceptor(imp::TlsAcceptor);
 
 impl TlsAcceptor {
+    /// Creates a acceptor with default settings.
+    ///
+    /// The identity acts as the server's private key/certificate chain.
+    pub fn new(identity: Identity) -> Result<TlsAcceptor> {
+        TlsAcceptor::builder(identity).build()
+    }
+
     /// Returns a new builder for a `TlsAcceptor`.
     ///
-    /// This builder is created with a key/certificate pair in the `pkcs12`
-    /// archived passed in. The returned builder will use that key/certificate
-    /// to send to clients which it connects to.
-    pub fn builder(pkcs12: Pkcs12) -> Result<TlsAcceptorBuilder> {
-        let builder = try!(imp::TlsAcceptor::builder(pkcs12.0));
-        Ok(TlsAcceptorBuilder(builder))
+    /// The identity acts as the server's private key/certificate chain.
+    pub fn builder(identity: Identity) -> TlsAcceptorBuilder {
+        TlsAcceptorBuilder {
+            identity,
+            min_protocol: Some(Protocol::Tlsv10),
+            max_protocol: None,
+        }
     }
 
     /// Initiates a TLS handshake.
     ///
     /// If the socket is nonblocking and a `WouldBlock` error is returned during
-    /// the handshake, a `HandshakeError::Interrupted` error will be returned
+    /// the handshake, a `HandshakeError::WouldBlock` error will be returned
     /// which can be used to restart the handshake when the socket is ready
     /// again.
     pub fn accept<S>(&self, stream: S) -> result::Result<TlsStream<S>, HandshakeError<S>>
-        where S: io::Read + io::Write
+    where
+        S: io::Read + io::Write,
     {
         match self.0.accept(stream) {
             Ok(s) => Ok(TlsStream(s)),
@@ -521,12 +622,24 @@ impl<S: io::Read + io::Write> TlsStream<S> {
     /// Returns the number of bytes that can be read without resulting in any
     /// network calls.
     pub fn buffered_read_size(&self) -> Result<usize> {
-        Ok(try!(self.0.buffered_read_size()))
+        Ok(self.0.buffered_read_size()?)
+    }
+
+    /// Returns the peer's leaf certificate, if available.
+    pub fn peer_certificate(&self) -> Result<Option<Certificate>> {
+        Ok(self.0.peer_certificate()?.map(Certificate))
+    }
+
+    /// Returns the tls-server-end-point channel binding data as defined in [RFC 5929].
+    ///
+    /// [RFC 5929]: https://tools.ietf.org/html/rfc5929
+    pub fn tls_server_end_point(&self) -> Result<Option<Vec<u8>>> {
+        Ok(self.0.tls_server_end_point()?)
     }
 
     /// Shuts down the TLS session.
     pub fn shutdown(&mut self) -> io::Result<()> {
-        try!(self.0.shutdown());
+        self.0.shutdown()?;
         Ok(())
     }
 }

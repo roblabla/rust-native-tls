@@ -1,44 +1,51 @@
+extern crate libc;
 extern crate security_framework;
 extern crate security_framework_sys;
-extern crate tempdir;
+extern crate tempfile;
 
 use self::security_framework::base;
 use self::security_framework::certificate::SecCertificate;
 use self::security_framework::identity::SecIdentity;
-use self::security_framework::import_export::Pkcs12ImportOptions;
-use self::security_framework::secure_transport::{self, SslContext, ProtocolSide, ConnectionType,
-                                                 SslProtocol, ClientBuilder};
-use self::security_framework::os::macos::keychain::{self, KeychainSettings};
+use self::security_framework::import_export::{ImportedIdentity, Pkcs12ImportOptions};
+use self::security_framework::secure_transport::{
+    self, ClientBuilder, SslConnectionType, SslContext, SslProtocol, SslProtocolSide,
+};
 use self::security_framework_sys::base::errSecIO;
-use self::tempdir::TempDir;
+use self::tempfile::TempDir;
+use std::error;
 use std::fmt;
 use std::io;
-use std::error;
+use std::sync::Mutex;
+use std::sync::{Once, ONCE_INIT};
 
-use Protocol;
+#[cfg(not(target_os = "ios"))]
+use self::security_framework::os::macos::certificate::{PropertyType, SecCertificateExt};
+#[cfg(not(target_os = "ios"))]
+use self::security_framework::os::macos::certificate_oids::CertificateOid;
+#[cfg(not(target_os = "ios"))]
+use self::security_framework::os::macos::import_export::{ImportOptions, SecItems};
+#[cfg(not(target_os = "ios"))]
+use self::security_framework::os::macos::keychain::{self, KeychainSettings, SecKeychain};
+#[cfg(not(target_os = "ios"))]
+use self::security_framework_sys::base::errSecParam;
+
+use {Protocol, TlsAcceptorBuilder, TlsConnectorBuilder};
+
+static SET_AT_EXIT: Once = ONCE_INIT;
+
+#[cfg(not(target_os = "ios"))]
+lazy_static! {
+    static ref TEMP_KEYCHAIN: Mutex<Option<(SecKeychain, TempDir)>> = Mutex::new(None);
+}
 
 fn convert_protocol(protocol: Protocol) -> SslProtocol {
     match protocol {
-        Protocol::Sslv3 => SslProtocol::Ssl3,
-        Protocol::Tlsv10 => SslProtocol::Tls1,
-        Protocol::Tlsv11 => SslProtocol::Tls11,
-        Protocol::Tlsv12 => SslProtocol::Tls12,
+        Protocol::Sslv3 => SslProtocol::SSL3,
+        Protocol::Tlsv10 => SslProtocol::TLS1,
+        Protocol::Tlsv11 => SslProtocol::TLS11,
+        Protocol::Tlsv12 => SslProtocol::TLS12,
         Protocol::__NonExhaustive => unreachable!(),
     }
-}
-
-fn protocol_min_max(protocols: &[Protocol]) -> (SslProtocol, SslProtocol) {
-    let mut min = Protocol::Tlsv12;
-    let mut max = Protocol::Sslv3;
-    for protocol in protocols {
-        if (*protocol as usize) < (min as usize) {
-            min = *protocol;
-        }
-        if (*protocol as usize) > (max as usize) {
-            max = *protocol;
-        }
-    }
-    (convert_protocol(min), convert_protocol(max))
 }
 
 pub struct Error(base::Error);
@@ -71,66 +78,107 @@ impl From<base::Error> for Error {
     }
 }
 
-pub struct Pkcs12 {
+#[derive(Clone)]
+pub struct Identity {
     identity: SecIdentity,
     chain: Vec<SecCertificate>,
 }
 
-impl Pkcs12 {
-    pub fn from_der(buf: &[u8], pass: &str) -> Result<Pkcs12, Error> {
-        let dir = match TempDir::new("native-tls") {
-            Ok(dir) => dir,
-            Err(_) => return Err(Error(base::Error::from(errSecIO))),
-        };
-
-        let mut keychain = try!(keychain::CreateOptions::new()
-            .password(pass)
-            .create(dir.path().join("tmp.keychain")));
-        // disable lock on sleep and timeouts
-        try!(keychain.set_settings(&KeychainSettings::new()));
-
-        let mut imports = try!(Pkcs12ImportOptions::new()
-            .passphrase(pass)
-            .keychain(keychain)
-            .import(buf));
+impl Identity {
+    pub fn from_pkcs12(buf: &[u8], pass: &str) -> Result<Identity, Error> {
+        let mut imports = Identity::import_options(buf, pass)?;
         let import = imports.pop().unwrap();
 
-        // FIXME: Compare the certificates for equality using CFEqual
-        let identity_cert = try!(import.identity.certificate()).to_der();
+        let identity = import
+            .identity
+            .expect("Pkcs12 files must include an identity");
 
-        Ok(Pkcs12 {
-            identity: import.identity,
-            chain: import.cert_chain
+        // FIXME: Compare the certificates for equality using CFEqual
+        let identity_cert = identity.certificate()?.to_der();
+
+        Ok(Identity {
+            identity: identity,
+            chain: import
+                .cert_chain
+                .unwrap_or(vec![])
                 .into_iter()
                 .filter(|c| c.to_der() != identity_cert)
                 .collect(),
         })
     }
+
+    #[cfg(not(target_os = "ios"))]
+    fn import_options(buf: &[u8], pass: &str) -> Result<Vec<ImportedIdentity>, Error> {
+        SET_AT_EXIT.call_once(|| {
+            extern "C" fn atexit() {
+                *TEMP_KEYCHAIN.lock().unwrap() = None;
+            }
+            unsafe {
+                libc::atexit(atexit);
+            }
+        });
+
+        let keychain = match *TEMP_KEYCHAIN.lock().unwrap() {
+            Some((ref keychain, _)) => keychain.clone(),
+            ref mut lock @ None => {
+                let dir = TempDir::new().map_err(|_| Error(base::Error::from(errSecIO)))?;
+
+                let mut keychain = keychain::CreateOptions::new()
+                    .password(pass)
+                    .create(dir.path().join("tmp.keychain"))?;
+                keychain.set_settings(&KeychainSettings::new())?;
+
+                *lock = Some((keychain.clone(), dir));
+                keychain
+            }
+        };
+        let imports = Pkcs12ImportOptions::new()
+            .passphrase(pass)
+            .keychain(keychain)
+            .import(buf)?;
+        Ok(imports)
+    }
+
+    #[cfg(target_os = "ios")]
+    fn import_options(buf: &[u8], pass: &str) -> Result<Vec<ImportedIdentity>, Error> {
+        let imports = Pkcs12ImportOptions::new().passphrase(pass).import(buf)?;
+        Ok(imports)
+    }
 }
 
+#[derive(Clone)]
 pub struct Certificate(SecCertificate);
 
 impl Certificate {
     pub fn from_der(buf: &[u8]) -> Result<Certificate, Error> {
-        let cert = try!(SecCertificate::from_der(buf));
+        let cert = SecCertificate::from_der(buf)?;
         Ok(Certificate(cert))
+    }
+
+    #[cfg(not(target_os = "ios"))]
+    pub fn from_pem(buf: &[u8]) -> Result<Certificate, Error> {
+        let mut items = SecItems::default();
+        ImportOptions::new().items(&mut items).import(buf)?;
+        if items.certificates.len() == 1 && items.identities.is_empty() && items.keys.is_empty() {
+            Ok(Certificate(items.certificates.pop().unwrap()))
+        } else {
+            Err(Error(base::Error::from(errSecParam)))
+        }
+    }
+
+    #[cfg(target_os = "ios")]
+    pub fn from_pem(buf: &[u8]) -> Result<Certificate, Error> {
+        panic!("Not implemented on iOS");
+    }
+
+    pub fn to_der(&self) -> Result<Vec<u8>, Error> {
+        Ok(self.0.to_der())
     }
 }
 
 pub enum HandshakeError<S> {
-    Interrupted(MidHandshakeTlsStream<S>),
+    WouldBlock(MidHandshakeTlsStream<S>),
     Failure(Error),
-}
-
-impl<S> From<secure_transport::HandshakeError<S>> for HandshakeError<S> {
-    fn from(e: secure_transport::HandshakeError<S>) -> HandshakeError<S> {
-        match e {
-            secure_transport::HandshakeError::Failure(e) => HandshakeError::Failure(e.into()),
-            secure_transport::HandshakeError::Interrupted(s) => {
-                HandshakeError::Interrupted(MidHandshakeTlsStream::Server(s))
-            }
-        }
-    }
 }
 
 impl<S> From<secure_transport::ClientHandshakeError<S>> for HandshakeError<S> {
@@ -138,7 +186,7 @@ impl<S> From<secure_transport::ClientHandshakeError<S>> for HandshakeError<S> {
         match e {
             secure_transport::ClientHandshakeError::Failure(e) => HandshakeError::Failure(e.into()),
             secure_transport::ClientHandshakeError::Interrupted(s) => {
-                HandshakeError::Interrupted(MidHandshakeTlsStream::Client(s))
+                HandshakeError::WouldBlock(MidHandshakeTlsStream::Client(s))
             }
         }
     }
@@ -151,261 +199,340 @@ impl<S> From<base::Error> for HandshakeError<S> {
 }
 
 pub enum MidHandshakeTlsStream<S> {
-    Server(secure_transport::MidHandshakeSslStream<S>),
+    Server(
+        secure_transport::MidHandshakeSslStream<S>,
+        Option<SecCertificate>,
+    ),
     Client(secure_transport::MidHandshakeClientBuilder<S>),
 }
 
 impl<S> fmt::Debug for MidHandshakeTlsStream<S>
-    where S: fmt::Debug
+where
+    S: fmt::Debug,
 {
     fn fmt(&self, fmt: &mut fmt::Formatter) -> fmt::Result {
         match *self {
-            MidHandshakeTlsStream::Server(ref s) => s.fmt(fmt),
+            MidHandshakeTlsStream::Server(ref s, _) => s.fmt(fmt),
             MidHandshakeTlsStream::Client(ref s) => s.fmt(fmt),
         }
     }
 }
 
 impl<S> MidHandshakeTlsStream<S>
-    where S: io::Read + io::Write
+where
+    S: io::Read + io::Write,
 {
     pub fn get_ref(&self) -> &S {
         match *self {
-            MidHandshakeTlsStream::Server(ref s) => s.get_ref(),
+            MidHandshakeTlsStream::Server(ref s, _) => s.get_ref(),
             MidHandshakeTlsStream::Client(ref s) => s.get_ref(),
         }
     }
 
     pub fn get_mut(&mut self) -> &mut S {
         match *self {
-            MidHandshakeTlsStream::Server(ref mut s) => s.get_mut(),
+            MidHandshakeTlsStream::Server(ref mut s, _) => s.get_mut(),
             MidHandshakeTlsStream::Client(ref mut s) => s.get_mut(),
         }
     }
 
     pub fn handshake(self) -> Result<TlsStream<S>, HandshakeError<S>> {
         match self {
-            MidHandshakeTlsStream::Server(s) => {
-                match s.handshake() {
-                    Ok(s) => Ok(TlsStream(s)),
-                    Err(e) => Err(e.into()),
+            MidHandshakeTlsStream::Server(s, cert) => match s.handshake() {
+                Ok(stream) => Ok(TlsStream { stream, cert }),
+                Err(secure_transport::HandshakeError::Failure(e)) => {
+                    Err(HandshakeError::Failure(Error(e)))
                 }
-            }
-            MidHandshakeTlsStream::Client(s) => {
-                match s.handshake() {
-                    Ok(s) => Ok(TlsStream(s)),
-                    Err(e) => Err(e.into()),
-                }
-            }
+                Err(secure_transport::HandshakeError::Interrupted(s)) => Err(
+                    HandshakeError::WouldBlock(MidHandshakeTlsStream::Server(s, cert)),
+                ),
+            },
+            MidHandshakeTlsStream::Client(s) => match s.handshake() {
+                Ok(stream) => Ok(TlsStream { stream, cert: None }),
+                Err(e) => Err(e.into()),
+            },
         }
     }
 }
 
-pub struct TlsConnectorBuilder(TlsConnector);
-
-impl TlsConnectorBuilder {
-    pub fn identity(&mut self, pkcs12: Pkcs12) -> Result<(), Error> {
-        self.0.pkcs12 = Some(pkcs12);
-        Ok(())
-    }
-
-    pub fn add_root_certificate(&mut self, cert: Certificate) -> Result<(), Error> {
-        self.0.roots.push(cert.0);
-        Ok(())
-    }
-
-    pub fn supported_protocols(&mut self, protocols: &[Protocol]) -> Result<(), Error> {
-        self.0.protocols = protocols.to_vec();
-        Ok(())
-    }
-
-    pub fn build(self) -> Result<TlsConnector, Error> {
-        Ok(self.0)
-    }
-}
-
+#[derive(Clone)]
 pub struct TlsConnector {
-    pkcs12: Option<Pkcs12>,
-    protocols: Vec<Protocol>,
+    identity: Option<Identity>,
+    min_protocol: Option<Protocol>,
+    max_protocol: Option<Protocol>,
     roots: Vec<SecCertificate>,
+    use_sni: bool,
+    danger_accept_invalid_hostnames: bool,
+    danger_accept_invalid_certs: bool,
 }
 
 impl TlsConnector {
-    pub fn builder() -> Result<TlsConnectorBuilder, Error> {
-        Ok(TlsConnectorBuilder(TlsConnector {
-            pkcs12: None,
-            protocols: vec![Protocol::Tlsv10, Protocol::Tlsv11, Protocol::Tlsv12],
-            roots: vec![],
-        }))
+    pub fn new(builder: &TlsConnectorBuilder) -> Result<TlsConnector, Error> {
+        Ok(TlsConnector {
+            identity: builder.identity.as_ref().map(|i| i.0.clone()),
+            min_protocol: builder.min_protocol,
+            max_protocol: builder.max_protocol,
+            roots: builder
+                .root_certificates
+                .iter()
+                .map(|c| (c.0).0.clone())
+                .collect(),
+            use_sni: builder.use_sni,
+            danger_accept_invalid_hostnames: builder.accept_invalid_hostnames,
+            danger_accept_invalid_certs: builder.accept_invalid_certs,
+        })
     }
 
-    pub fn connect<S>(&self,
-                      domain: &str,
-                      stream: S)
-                      -> Result<TlsStream<S>, HandshakeError<S>>
-        where S: io::Read + io::Write
-    {
-        self.connect_inner(Some(domain), stream)
-    }
-
-    pub fn connect_no_domain<S>(&self, stream: S) -> Result<TlsStream<S>, HandshakeError<S>>
-        where S: io::Read + io::Write
-    {
-        self.connect_inner(None, stream)
-    }
-
-    fn connect_inner<S>(&self,
-                   domain: Option<&str>,
-                   stream: S)
-                   -> Result<TlsStream<S>, HandshakeError<S>>
-        where S: io::Read + io::Write
+    pub fn connect<S>(&self, domain: &str, stream: S) -> Result<TlsStream<S>, HandshakeError<S>>
+    where
+        S: io::Read + io::Write,
     {
         let mut builder = ClientBuilder::new();
-        let (min, max) = protocol_min_max(&self.protocols);
-        builder.protocol_min(min);
-        builder.protocol_max(max);
-        if let Some(pkcs12) = self.pkcs12.as_ref() {
-            builder.identity(&pkcs12.identity, &pkcs12.chain);
+        if let Some(min) = self.min_protocol {
+            builder.protocol_min(convert_protocol(min));
+        }
+        if let Some(max) = self.max_protocol {
+            builder.protocol_max(convert_protocol(max));
+        }
+        if let Some(identity) = self.identity.as_ref() {
+            builder.identity(&identity.identity, &identity.chain);
         }
         builder.anchor_certificates(&self.roots);
+        builder.use_sni(self.use_sni);
+        builder.danger_accept_invalid_hostnames(self.danger_accept_invalid_hostnames);
+        builder.danger_accept_invalid_certs(self.danger_accept_invalid_certs);
 
-        let r = match domain {
-            Some(domain) => builder.handshake2(domain, stream),
-            None => builder.danger_handshake_without_providing_domain_for_certificate_validation_and_server_name_indication(stream),
-        };
-        match r {
-            Ok(s) => Ok(TlsStream(s)),
+        match builder.handshake(domain, stream) {
+            Ok(stream) => Ok(TlsStream { stream, cert: None }),
             Err(e) => Err(e.into()),
         }
     }
 }
 
-pub struct TlsAcceptorBuilder(TlsAcceptor);
-
-impl TlsAcceptorBuilder {
-    pub fn supported_protocols(&mut self, protocols: &[Protocol]) -> Result<(), Error> {
-        self.0.protocols = protocols.to_vec();
-        Ok(())
-    }
-
-    pub fn build(self) -> Result<TlsAcceptor, Error> {
-        Ok(self.0)
-    }
-}
-
+#[derive(Clone)]
 pub struct TlsAcceptor {
-    pkcs12: Pkcs12,
-    protocols: Vec<Protocol>,
+    identity: Identity,
+    min_protocol: Option<Protocol>,
+    max_protocol: Option<Protocol>,
 }
 
 impl TlsAcceptor {
-    pub fn builder(pkcs12: Pkcs12) -> Result<TlsAcceptorBuilder, Error> {
-        Ok(TlsAcceptorBuilder(TlsAcceptor {
-            pkcs12: pkcs12,
-            protocols: vec![Protocol::Tlsv10, Protocol::Tlsv11, Protocol::Tlsv12],
-        }))
+    pub fn new(builder: &TlsAcceptorBuilder) -> Result<TlsAcceptor, Error> {
+        Ok(TlsAcceptor {
+            identity: builder.identity.0.clone(),
+            min_protocol: builder.min_protocol,
+            max_protocol: builder.max_protocol,
+        })
     }
 
     pub fn accept<S>(&self, stream: S) -> Result<TlsStream<S>, HandshakeError<S>>
-        where S: io::Read + io::Write
+    where
+        S: io::Read + io::Write,
     {
-        let mut ctx = try!(SslContext::new(ProtocolSide::Server, ConnectionType::Stream));
+        let mut ctx = SslContext::new(SslProtocolSide::SERVER, SslConnectionType::STREAM)?;
 
-        let (min, max) = protocol_min_max(&self.protocols);
-        try!(ctx.set_protocol_version_min(min));
-        try!(ctx.set_protocol_version_max(max));
-        try!(ctx.set_certificate(&self.pkcs12.identity, &self.pkcs12.chain));
+        if let Some(min) = self.min_protocol {
+            ctx.set_protocol_version_min(convert_protocol(min))?;
+        }
+        if let Some(max) = self.max_protocol {
+            ctx.set_protocol_version_max(convert_protocol(max))?;
+        }
+        ctx.set_certificate(&self.identity.identity, &self.identity.chain)?;
+        let cert = Some(self.identity.identity.certificate()?);
         match ctx.handshake(stream) {
-            Ok(s) => Ok(TlsStream(s)),
-            Err(e) => Err(e.into()),
+            Ok(stream) => Ok(TlsStream { stream, cert }),
+            Err(secure_transport::HandshakeError::Failure(e)) => {
+                Err(HandshakeError::Failure(Error(e)))
+            }
+            Err(secure_transport::HandshakeError::Interrupted(s)) => Err(
+                HandshakeError::WouldBlock(MidHandshakeTlsStream::Server(s, cert)),
+            ),
         }
     }
 }
 
-pub struct TlsStream<S>(secure_transport::SslStream<S>);
+pub struct TlsStream<S> {
+    stream: secure_transport::SslStream<S>,
+    cert: Option<SecCertificate>,
+}
 
 impl<S: fmt::Debug> fmt::Debug for TlsStream<S> {
     fn fmt(&self, fmt: &mut fmt::Formatter) -> fmt::Result {
-        fmt::Debug::fmt(&self.0, fmt)
+        fmt::Debug::fmt(&self.stream, fmt)
     }
 }
 
 impl<S: io::Read + io::Write> TlsStream<S> {
     pub fn get_ref(&self) -> &S {
-        self.0.get_ref()
+        self.stream.get_ref()
     }
 
     pub fn get_mut(&mut self) -> &mut S {
-        self.0.get_mut()
+        self.stream.get_mut()
     }
 
     pub fn buffered_read_size(&self) -> Result<usize, Error> {
-        Ok(try!(self.0.context().buffered_read_size()))
+        Ok(self.stream.context().buffered_read_size()?)
+    }
+
+    pub fn peer_certificate(&self) -> Result<Option<Certificate>, Error> {
+        let trust = match self.stream.context().peer_trust2()? {
+            Some(trust) => trust,
+            None => return Ok(None),
+        };
+        trust.evaluate()?;
+
+        Ok(trust.certificate_at_index(0).map(Certificate))
+    }
+
+    #[cfg(target_os = "ios")]
+    pub fn tls_server_end_point(&self) -> Result<Option<Vec<u8>>, Error> {
+        Ok(None)
+    }
+
+    #[cfg(not(target_os = "ios"))]
+    pub fn tls_server_end_point(&self) -> Result<Option<Vec<u8>>, Error> {
+        let cert = match self.cert {
+            Some(ref cert) => cert.clone(),
+            None => match self.peer_certificate()? {
+                Some(cert) => cert.0,
+                None => return Ok(None),
+            },
+        };
+
+        let property = match cert
+            .properties(Some(&[CertificateOid::x509_v1_signature_algorithm()]))
+            .ok()
+            .and_then(|p| p.get(CertificateOid::x509_v1_signature_algorithm()))
+        {
+            Some(property) => property,
+            None => return Ok(None),
+        };
+
+        let section = match property.get() {
+            PropertyType::Section(section) => section,
+            _ => return Ok(None),
+        };
+
+        let algorithm = match section
+            .iter()
+            .filter(|p| p.label().to_string() == "Algorithm")
+            .next()
+        {
+            Some(property) => property,
+            None => return Ok(None),
+        };
+
+        let algorithm = match algorithm.get() {
+            PropertyType::String(algorithm) => algorithm,
+            _ => return Ok(None),
+        };
+
+        let digest = match &*algorithm.to_string() {
+            // MD5
+            "1.2.840.113549.2.5" | "1.2.840.113549.1.1.4" | "1.3.14.3.2.3" => Digest::Sha256,
+            // SHA-1
+            "1.3.14.3.2.26"
+            | "1.3.14.3.2.15"
+            | "1.2.840.113549.1.1.5"
+            | "1.3.14.3.2.29"
+            | "1.2.840.10040.4.3"
+            | "1.3.14.3.2.13"
+            | "1.2.840.10045.4.1" => Digest::Sha256,
+            // SHA-224
+            "2.16.840.1.101.3.4.2.4"
+            | "1.2.840.113549.1.1.14"
+            | "2.16.840.1.101.3.4.3.1"
+            | "1.2.840.10045.4.3.1" => Digest::Sha224,
+            // SHA-256
+            "2.16.840.1.101.3.4.2.1" | "1.2.840.113549.1.1.11" | "1.2.840.10045.4.3.2" => {
+                Digest::Sha256
+            }
+            // SHA-384
+            "2.16.840.1.101.3.4.2.2" | "1.2.840.113549.1.1.12" | "1.2.840.10045.4.3.3" => {
+                Digest::Sha384
+            }
+            // SHA-512
+            "2.16.840.1.101.3.4.2.3" | "1.2.840.113549.1.1.13" | "1.2.840.10045.4.3.4" => {
+                Digest::Sha512
+            }
+            _ => return Ok(None),
+        };
+
+        let der = cert.to_der();
+        Ok(Some(digest.hash(&der)))
     }
 
     pub fn shutdown(&mut self) -> io::Result<()> {
-        try!(self.0.close());
+        self.stream.close()?;
         Ok(())
     }
 }
 
 impl<S: io::Read + io::Write> io::Read for TlsStream<S> {
     fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
-        self.0.read(buf)
+        self.stream.read(buf)
     }
 }
 
 impl<S: io::Read + io::Write> io::Write for TlsStream<S> {
     fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
-        self.0.write(buf)
+        self.stream.write(buf)
     }
 
     fn flush(&mut self) -> io::Result<()> {
-        self.0.flush()
+        self.stream.flush()
     }
 }
 
-/// Security Framework-specific extensions to `TlsStream`.
-pub trait TlsStreamExt<S> {
-    /// Returns a shared reference to the Security Framework `SslStream`.
-    fn raw_stream(&self) -> &secure_transport::SslStream<S>;
-
-    /// Returns a mutable reference to the Security Framework `SslStream`.
-    fn raw_stream_mut(&mut self) -> &mut secure_transport::SslStream<S>;
+enum Digest {
+    Sha224,
+    Sha256,
+    Sha384,
+    Sha512,
 }
 
-impl<S> TlsStreamExt<S> for ::TlsStream<S> {
-    fn raw_stream(&self) -> &secure_transport::SslStream<S> {
-        &(self.0).0
+impl Digest {
+    fn hash(&self, data: &[u8]) -> Vec<u8> {
+        unsafe {
+            assert!(data.len() <= CC_LONG::max_value() as usize);
+            match *self {
+                Digest::Sha224 => {
+                    let mut buf = [0; CC_SHA224_DIGEST_LENGTH];
+                    CC_SHA224(data.as_ptr(), data.len() as CC_LONG, buf.as_mut_ptr());
+                    buf.to_vec()
+                }
+                Digest::Sha256 => {
+                    let mut buf = [0; CC_SHA256_DIGEST_LENGTH];
+                    CC_SHA256(data.as_ptr(), data.len() as CC_LONG, buf.as_mut_ptr());
+                    buf.to_vec()
+                }
+                Digest::Sha384 => {
+                    let mut buf = [0; CC_SHA384_DIGEST_LENGTH];
+                    CC_SHA384(data.as_ptr(), data.len() as CC_LONG, buf.as_mut_ptr());
+                    buf.to_vec()
+                }
+                Digest::Sha512 => {
+                    let mut buf = [0; CC_SHA512_DIGEST_LENGTH];
+                    CC_SHA512(data.as_ptr(), data.len() as CC_LONG, buf.as_mut_ptr());
+                    buf.to_vec()
+                }
+            }
+        }
     }
-
-    fn raw_stream_mut(&mut self) -> &mut secure_transport::SslStream<S> {
-        &mut (self.0).0
-    }
 }
 
-/// Security Framework-specific extensions to `TlsConnectorBuilder`.
-pub trait TlsConnectorBuilderExt {
-    /// Deprecated
-    #[deprecated(since = "0.1.2", note = "use add_root_certificate")]
-    fn anchor_certificates(&mut self, certs: &[SecCertificate]) -> &mut Self;
-}
+// FIXME ideally we'd pull these in from elsewhere
+const CC_SHA224_DIGEST_LENGTH: usize = 28;
+const CC_SHA256_DIGEST_LENGTH: usize = 32;
+const CC_SHA384_DIGEST_LENGTH: usize = 48;
+const CC_SHA512_DIGEST_LENGTH: usize = 64;
+#[allow(non_camel_case_types)]
+type CC_LONG = u32;
 
-impl TlsConnectorBuilderExt for ::TlsConnectorBuilder {
-    fn anchor_certificates(&mut self, certs: &[SecCertificate]) -> &mut Self {
-        (self.0).0.roots = certs.to_owned();
-        self
-    }
-}
-
-/// Security Framework-specific extensions to `Error`
-pub trait ErrorExt {
-    /// Extract the underlying Security Framework error for inspection.
-    fn security_framework_error(&self) -> &base::Error;
-}
-
-impl ErrorExt for ::Error {
-    fn security_framework_error(&self) -> &base::Error {
-        &(self.0).0
-    }
+extern "C" {
+    fn CC_SHA224(data: *const u8, len: CC_LONG, md: *mut u8) -> *mut u8;
+    fn CC_SHA256(data: *const u8, len: CC_LONG, md: *mut u8) -> *mut u8;
+    fn CC_SHA384(data: *const u8, len: CC_LONG, md: *mut u8) -> *mut u8;
+    fn CC_SHA512(data: *const u8, len: CC_LONG, md: *mut u8) -> *mut u8;
 }
